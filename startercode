@@ -1,0 +1,195 @@
+#include <Wire.h>
+#include <Adafruit_MotorShield.h>
+#include "utility/Adafruit_MS_PWMServoDriver.h"
+#include <Adafruit_RGBLCDShield.h>
+
+// ==========================
+// USER CONFIG (edit here)
+// ==========================
+
+// Which motor port are you using?
+// If your stepper is on M1/M2 => MOTOR_PORT = 1
+// If on M3/M4 => MOTOR_PORT = 2
+#define MOTOR_PORT 1
+
+// Your stepper full steps per revolution (most NEMA17 are 200)
+const int STEPS_PER_REV = 200;
+
+// Default UI values (you can change on the LCD)
+volatile bool directionCW = true;     // true = CW, false = CCW
+volatile bool runContinuous = true;   // true = Continuous, false = Dosed
+volatile float targetRPM = 20.0;      // default speed
+volatile float dose_mL = 10.0;        // only used in Dosed mode
+
+// Calibration constant: how many mL per revolution?
+// TEMP GUESS. We'll refine once you tell me tubing & head geometry.
+volatile float mL_per_rev = 1.2;
+
+// ==========================
+// GLOBALS
+// ==========================
+Adafruit_MotorShield AFMS = Adafruit_MotorShield();
+Adafruit_StepperMotor *stepper =
+    (MOTOR_PORT == 1) ? AFMS.getStepper(STEPS_PER_REV, 1)
+                      : AFMS.getStepper(STEPS_PER_REV, 2);
+
+Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
+
+// Button bitmasks from the LCD shield lib
+#define BTN_RIGHT  0x01
+#define BTN_UP     0x02
+#define BTN_DOWN   0x04
+#define BTN_LEFT   0x08
+#define BTN_SELECT 0x10
+
+// UI state
+enum MenuItem { MENU_MODE, MENU_RPM, MENU_DOSE, MENU_DIR, MENU_STARTSTOP };
+MenuItem menu = MENU_MODE;
+bool isRunning = false;
+
+// Step timing
+unsigned long lastStepMicros = 0;
+unsigned long stepIntervalMicros = 0; // computed from RPM
+// For dosed runs
+long stepsToGo = 0;
+
+// Helper to update step interval based on targetRPM
+void recomputeInterval() {
+  // steps per second = (RPM * steps/rev) / 60
+  float sps = (targetRPM * STEPS_PER_REV) / 60.0f;
+  if (sps < 1) sps = 1; // avoid div by zero / too slow
+  stepIntervalMicros = (unsigned long)(1000000.0f / sps);
+}
+
+// Compute steps needed for a given dose (mL)
+long doseToSteps(float mL) {
+  // revs needed = mL / (mL per rev)
+  // steps needed = revs * steps_per_rev
+  float revs = mL / mL_per_rev;
+  if (revs < 0) revs = 0;
+  long steps = (long)(revs * STEPS_PER_REV + 0.5f);
+  if (steps < 1) steps = 1;
+  return steps;
+}
+
+void drawUI() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  // Line 1: menu item name
+  switch(menu) {
+    case MENU_MODE:      lcd.print("Mode: "); lcd.print(runContinuous ? "Cont" : "Dose"); break;
+    case MENU_RPM:       lcd.print("Speed (RPM):"); break;
+    case MENU_DOSE:      lcd.print("Dose (mL):");   break;
+    case MENU_DIR:       lcd.print("Dir: "); lcd.print(directionCW ? "CW" : "CCW"); break;
+    case MENU_STARTSTOP: lcd.print(isRunning ? "STOP Pump" : "START Pump"); break;
+  }
+  // Line 2: value / status
+  lcd.setCursor(0,1);
+  if (menu == MENU_RPM) {
+    lcd.print(targetRPM, 1);
+  } else if (menu == MENU_DOSE) {
+    if (runContinuous) lcd.print("(Cont mode)");
+    else lcd.print(dose_mL, 1);
+  } else if (menu == MENU_MODE) {
+    lcd.print("mL/rev:");
+    lcd.print(mL_per_rev, 2);
+  } else if (menu == MENU_STARTSTOP) {
+    lcd.print(runContinuous ? "Continuous" : "Dose");
+  } else if (menu == MENU_DIR) {
+    lcd.print("RPM:");
+    lcd.print(targetRPM, 1);
+  }
+}
+
+void handleButtons() {
+  uint8_t b = lcd.readButtons();
+  if (!b) return;
+
+  if (b & BTN_RIGHT) {
+    // next menu item
+    menu = (MenuItem)((menu + 1) % 5);
+    drawUI();
+    delay(150);
+  }
+  if (b & BTN_LEFT) {
+    // previous menu item
+    menu = (MenuItem)((menu + 4) % 5);
+    drawUI();
+    delay(150);
+  }
+  if (b & BTN_UP) {
+    switch(menu) {
+      case MENU_MODE: runContinuous = !runContinuous; break;
+      case MENU_RPM:  targetRPM += 1.0; if (targetRPM > 120.0) targetRPM = 120.0; recomputeInterval(); break;
+      case MENU_DOSE: dose_mL += 1.0; if (dose_mL > 1000.0) dose_mL = 1000.0; break;
+      case MENU_DIR:  directionCW = !directionCW; break;
+      case MENU_STARTSTOP: /* no-op */ break;
+    }
+    drawUI();
+    delay(120);
+  }
+  if (b & BTN_DOWN) {
+    switch(menu) {
+      case MENU_MODE: runContinuous = !runContinuous; break;
+      case MENU_RPM:  targetRPM -= 1.0; if (targetRPM < 1.0) targetRPM = 1.0; recomputeInterval(); break;
+      case MENU_DOSE: dose_mL -= 1.0; if (dose_mL < 0.5) dose_mL = 0.5; break;
+      case MENU_DIR:  directionCW = !directionCW; break;
+      case MENU_STARTSTOP: /* no-op */ break;
+    }
+    drawUI();
+    delay(120);
+  }
+  if (b & BTN_SELECT) {
+    if (isRunning) {
+      isRunning = false;
+    } else {
+      if (runContinuous) {
+        isRunning = true;
+      } else {
+        stepsToGo = doseToSteps(dose_mL);
+        isRunning = true;
+      }
+    }
+    drawUI();
+    delay(180);
+  }
+}
+
+void setup() {
+  AFMS.begin();            // initialize motor shield (default I2C addr 0x60)
+  stepper->setSpeed(60);   // library requires setSpeed (RPM) but we'll time steps ourselves
+  lcd.begin(16, 2);
+  // If using RGB shield on mono display, no need to set color
+  lcd.print("Peristaltic v1");
+  delay(800);
+  lcd.clear();
+  recomputeInterval();
+  drawUI();
+}
+
+void loop() {
+  handleButtons();
+
+  if (!isRunning) return;
+
+  // Non-blocking step timing
+  unsigned long now = micros();
+  if (now - lastStepMicros >= stepIntervalMicros) {
+    lastStepMicros = now;
+
+    // Do one step in DOUBLE (double-coil) mode for torque
+    if (directionCW) {
+      stepper->onestep(FORWARD, DOUBLE);
+    } else {
+      stepper->onestep(BACKWARD, DOUBLE);
+    }
+
+    if (!runContinuous) {
+      stepsToGo--;
+      if (stepsToGo <= 0) {
+        isRunning = false; // done with dose
+        drawUI();
+      }
+    }
+  }
+}
