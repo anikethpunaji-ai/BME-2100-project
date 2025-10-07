@@ -1,0 +1,174 @@
+#include <Wire.h>
+#include <Adafruit_MotorShield.h>
+#include "utility/Adafruit_MS_PWMServoDriver.h"
+#include <Adafruit_RGBLCDShield.h>
+
+// ==========================
+// CONFIG
+// ==========================
+#define MOTOR_PORT 2         // Using M3/M4
+const int STEPS_PER_REV = 200;
+volatile float mL_per_rev = 1.2; // calibration
+
+// ==========================
+// GLOBAL VARIABLES
+// ==========================
+Adafruit_MotorShield AFMS = Adafruit_MotorShield();
+Adafruit_StepperMotor *stepper = AFMS.getStepper(STEPS_PER_REV, MOTOR_PORT);
+Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
+
+// Button bitmasks
+#define BTN_RIGHT  0x01
+#define BTN_UP     0x02
+#define BTN_DOWN   0x04
+#define BTN_LEFT   0x08
+#define BTN_SELECT 0x10
+
+// Menu state
+enum MenuItem { MENU_RATE, MENU_VOLUME, MENU_DIR, MENU_STARTSTOP };
+MenuItem menu = MENU_RATE;
+
+// Infusion state
+bool isRunning = false;
+bool directionCW = true;
+float rate_mL_min = 5.0;   // user-set infusion rate (mL/min)
+float totalVolume_mL = 10.0; // total volume target
+float infused_mL = 0.0;      // track progress
+
+// Timing
+unsigned long lastStepMillis = 0;
+unsigned long stepIntervalMillis = 0;
+long totalSteps = 0;
+long stepsTaken = 0;
+
+// ==========================
+// FUNCTION DEFINITIONS
+// ==========================
+
+// Compute step interval based on infusion rate
+void recomputeInterval() {
+  // revs per minute = rate (mL/min) / mL_per_rev
+  float revsPerMin = rate_mL_min / mL_per_rev;
+  // steps per second = (revs/min * steps/rev) / 60
+  float stepsPerSec = (revsPerMin * STEPS_PER_REV) / 60.0;
+  if (stepsPerSec < 0.1) stepsPerSec = 0.1; // prevent divide by zero
+  stepIntervalMillis = (unsigned long)(1000.0 / stepsPerSec);
+}
+
+// Compute total steps needed for target volume
+long volumeToSteps(float mL) {
+  float revs = mL / mL_per_rev;
+  return (long)(revs * STEPS_PER_REV + 0.5);
+}
+
+// Update LCD screen
+void drawUI() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  switch(menu) {
+    case MENU_RATE: lcd.print("Rate: "); lcd.print(rate_mL_min,1); lcd.print(" mL/min"); break;
+    case MENU_VOLUME: lcd.print("Volume: "); lcd.print(totalVolume_mL,1); lcd.print(" mL"); break;
+    case MENU_DIR: lcd.print("Dir: "); lcd.print(directionCW ? "FWD" : "REV"); break;
+    case MENU_STARTSTOP: lcd.print(isRunning ? "STOP Infusion" : "START Infusion"); break;
+  }
+
+  lcd.setCursor(0,1);
+  if (isRunning) {
+    float remaining = totalVolume_mL - infused_mL;
+    if (remaining < 0) remaining = 0;
+    lcd.print("Infused: ");
+    lcd.print(infused_mL,1);
+    lcd.print(" mL");
+  } else {
+    lcd.print("Remaining: ");
+    lcd.print(totalVolume_mL - infused_mL,1);
+    lcd.print(" mL");
+  }
+}
+
+// Handle LCD button input
+void handleButtons() {
+  uint8_t b = lcd.readButtons();
+  if (!b) return;
+
+  if (b & BTN_RIGHT) {
+    menu = (MenuItem)((menu + 1) % 4);
+    drawUI();
+    delay(150);
+  }
+  if (b & BTN_LEFT) {
+    menu = (MenuItem)((menu + 3) % 4);
+    drawUI();
+    delay(150);
+  }
+  if (b & BTN_UP) {
+    switch(menu) {
+      case MENU_RATE: rate_mL_min += 1.0; recomputeInterval(); break;
+      case MENU_VOLUME: totalVolume_mL += 1.0; break;
+      case MENU_DIR: directionCW = !directionCW; break;
+      default: break;
+    }
+    drawUI();
+    delay(120);
+  }
+  if (b & BTN_DOWN) {
+    switch(menu) {
+      case MENU_RATE: rate_mL_min -= 1.0; if (rate_mL_min < 0.5) rate_mL_min = 0.5; recomputeInterval(); break;
+      case MENU_VOLUME: totalVolume_mL -= 1.0; if (totalVolume_mL < 0.5) totalVolume_mL = 0.5; break;
+      case MENU_DIR: directionCW = !directionCW; break;
+      default: break;
+    }
+    drawUI();
+    delay(120);
+  }
+  if (b & BTN_SELECT) {
+    if (isRunning) {
+      isRunning = false;
+    } else {
+      isRunning = true;
+      infused_mL = 0.0;
+      stepsTaken = 0;
+      totalSteps = volumeToSteps(totalVolume_mL);
+    }
+    drawUI();
+    delay(200);
+  }
+}
+
+// ==========================
+// SETUP & LOOP
+// ==========================
+void setup() {
+  AFMS.begin();
+  lcd.begin(16,2);
+  lcd.print("Infusion Pump");
+  delay(800);
+  lcd.clear();
+
+  recomputeInterval();
+  drawUI();
+}
+
+void loop() {
+  handleButtons();
+
+  if (!isRunning) return;
+
+  unsigned long now = millis();
+  if (now - lastStepMillis >= stepIntervalMillis) {
+    lastStepMillis += stepIntervalMillis;
+
+    // Step the motor
+    if (directionCW) stepper->onestep(FORWARD, DOUBLE);
+    else stepper->onestep(BACKWARD, DOUBLE);
+
+    stepsTaken++;
+    infused_mL = (stepsTaken / (float)STEPS_PER_REV) * mL_per_rev;
+
+    // Stop automatically if dose complete
+    if (infused_mL >= totalVolume_mL) {
+      isRunning = false;
+      drawUI();
+    }
+  }
+}
